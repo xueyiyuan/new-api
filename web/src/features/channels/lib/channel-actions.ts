@@ -27,6 +27,7 @@ import {
   copyChannel,
   deleteChannel,
   testChannel,
+  testChannelImage,
   updateChannel,
   updateChannelStatus,
   batchUpdateChannelStatus,
@@ -41,7 +42,11 @@ import {
   updateAllChannelsBalance,
 } from '../api'
 import { CHANNEL_STATUS, ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
-import type { ChannelTestResponse, CopyChannelParams } from '../types'
+import type {
+  ChannelImageTestResponse,
+  ChannelTestResponse,
+  CopyChannelParams,
+} from '../types'
 
 // ============================================================================
 // Query Keys
@@ -342,6 +347,74 @@ export async function handleTestChannel(
       })
     }
     onTestComplete?.(false, undefined, errorMsg)
+  }
+}
+
+/**
+ * Trigger a browser download for a base64-encoded image.
+ */
+function downloadBase64Image(base64: string, filename: string): void {
+  const clean = base64.includes(',') ? base64.split(',')[1] : base64
+  const byteChars = atob(clean)
+  const byteNumbers = new Array(byteChars.length)
+  for (let i = 0; i < byteChars.length; i++) {
+    byteNumbers[i] = byteChars.charCodeAt(i)
+  }
+  const byteArray = new Uint8Array(byteNumbers)
+  const blob = new Blob([byteArray], { type: 'image/png' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/**
+ * Test a channel's image-generation capability: call the channel's first image
+ * model against the upstream images endpoint, download the generated image to the
+ * browser's default download location, and surface the result via a toast.
+ */
+export async function handleTestChannelImage(
+  id: number,
+  options?: { channelName?: string; model?: string }
+): Promise<void> {
+  try {
+    const resp: ChannelImageTestResponse = await testChannelImage(id, {
+      model: options?.model,
+    })
+    if (resp.success && resp.format === 'b64_json' && resp.image) {
+      const safeModel = (resp.model || 'image').replace(/[^a-zA-Z0-9_-]/g, '_')
+      downloadBase64Image(resp.image, `channel_${id}_${safeModel}.png`)
+      toast.success(
+        options?.channelName
+          ? i18next.t('{{name}} 图片生成成功，请打开校验', { name: options.channelName })
+          : i18next.t('图片生成成功，请打开校验')
+      )
+      return
+    }
+
+    const msg = resp.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
+    toast.error(
+      i18next.t('图片生成失败'),
+      resp.error_code
+        ? { description: `${msg} (${resp.error_code})` }
+        : { description: msg }
+    )
+  } catch (error) {
+    const err = error as {
+      response?: { data?: { message?: string; error_code?: string } }
+    }
+    const data = err?.response?.data
+    const msg = data?.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
+    toast.error(
+      i18next.t('图片生成失败'),
+      data?.error_code
+        ? { description: `${msg} (${data.error_code})` }
+        : { description: msg }
+    )
   }
 }
 

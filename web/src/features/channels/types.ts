@@ -206,6 +206,16 @@ export interface ChannelTestResponse {
   }
 }
 
+export interface ChannelImageTestResponse {
+  success: boolean
+  model?: string
+  format?: 'b64_json' | 'url'
+  image?: string
+  message?: string
+  error_code?: string
+  tried_models?: string[]
+}
+
 export interface ChannelBalanceResponse {
   success: boolean
   message?: string

@@ -1,0 +1,467 @@
+diff --git a/controller/channel-image-test.go b/controller/channel-image-test.go
+new file mode 100644
+index 000000000..822b21832
+--- /dev/null
++++ b/controller/channel-image-test.go
+@@ -0,0 +1,240 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without any warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++*/
++
++package controller
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/gin-gonic/gin"
++	"github.com/tidwall/gjson"
++)
++
++// imageModelKeywords lists substrings used to recognise an image-generation
++// model name when scanning a channel's model list. The first model whose name
++// contains any keyword is treated as the channel's "first image model".
++var imageModelKeywords = []string{
++	"image", // gpt-image-2, gemini-...-image, etc.
++	"dall",  // dall-e, dall·e
++	"imagen",
++	"flux",
++	"stable-diffusion",
++	"sdxl",
++	"midjourney", "mj-",
++	"seedream",
++	"nano-banana",
++	"glm-image", "cogview", "janus", "kolors", "wan",
++	"ideogram", "recraft", "playground", "aura",
++	"emusion", "turbos",
++}
++
++// TestChannelImage verifies a channel's image-generation capability by sending a
++// real request to {channel.base_url}/v1/images/generations using the channel's
++// first image model (or an explicit ?model= override) together with the channel
++// key. It never hard-codes any upstream URL — the upstream is derived entirely
++// from the channel configuration selected by the caller.
++//
++//	POST /api/channel/test_image/:id
++func TestChannelImage(c *gin.Context) {
++	channelID, err := strconv.Atoi(c.Param("id"))
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++
++	channel, err := model.CacheGetChannel(channelID)
++	if err != nil {
++		channel, err = model.GetChannelById(channelID, true)
++		if err != nil {
++			common.ApiError(c, err)
++			return
++		}
++	}
++
++	override := strings.TrimSpace(c.Query("model"))
++	imageModel, tried := resolveImageModel(channel, override)
++	if imageModel == "" {
++		c.JSON(http.StatusOK, gin.H{
++			"success":      false,
++			"error_code":   "NO_IMAGE_MODEL",
++			"message":      "该渠道未找到可用的图像模型（image model）。请在渠道模型列表中确认包含图像模型，或用 ?model= 显式指定。",
++			"tried_models": tried,
++		})
++		return
++	}
++
++	baseURL := strings.TrimRight(channel.GetBaseURL(), "/")
++	imagePath := "/v1/images/generations"
++	if strings.HasSuffix(baseURL, "/v1") {
++		imagePath = "/images/generations"
++	}
++	if endpoint := strings.TrimSpace(c.Query("endpoint")); endpoint != "" {
++		imagePath = endpoint
++	}
++	fullURL := baseURL + imagePath
++
++	key, _, newAPIErr := channel.GetNextEnabledKey()
++	if newAPIErr != nil {
++		c.JSON(http.StatusOK, gin.H{
++			"success":    false,
++			"error_code": "NO_AVAILABLE_KEY",
++			"message":    "该渠道没有可用的 API Key。",
++			"model":      imageModel,
++		})
++		return
++	}
++
++	body := map[string]any{
++		"model":  imageModel,
++		"prompt": "A small red apple on a white background, minimalist product photo.",
++		"n":      1,
++		"size":   "1024x1024",
++	}
++	payload, _ := json.Marshal(body)
++
++	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(payload))
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", "Bearer "+key)
++
++	client := &http.Client{Timeout: 120 * time.Second}
++	resp, err := client.Do(req)
++	if err != nil {
++		c.JSON(http.StatusOK, gin.H{
++			"success":      false,
++			"error_code":   "UPSTREAM_UNREACHABLE",
++			"message":      fmt.Sprintf("无法连接上游 (%s)：%s", fullURL, err.Error()),
++			"model":        imageModel,
++			"tried_models": tried,
++		})
++		return
++	}
++	defer resp.Body.Close()
++	respBody, _ := io.ReadAll(resp.Body)
++
++	if resp.StatusCode != http.StatusOK {
++		c.JSON(http.StatusOK, gin.H{
++			"success":      false,
++			"error_code":   fmt.Sprintf("UPSTREAM_HTTP_%d", resp.StatusCode),
++			"message":      fmt.Sprintf("上游返回 HTTP %d：%s", resp.StatusCode, truncate(string(respBody), 600)),
++			"model":        imageModel,
++			"tried_models": tried,
++		})
++		return
++	}
++
++	// OpenAI-compatible response: { "data": [ { "b64_json": "..." } | { "url": "..." } ] }
++	b64 := gjson.GetBytes(respBody, "data.0.b64_json").String()
++	url := gjson.GetBytes(respBody, "data.0.url").String()
++
++	if b64 == "" && url == "" {
++		c.JSON(http.StatusOK, gin.H{
++			"success":      false,
++			"error_code":   "NO_IMAGE_IN_RESPONSE",
++			"message":      "上游返回 200，但响应中未包含 b64_json 或 url 字段，可能不是标准的 images 接口响应。",
++			"model":        imageModel,
++			"tried_models": tried,
++		})
++		return
++	}
++
++	if b64 == "" && url != "" {
++		// Fetch the image server-side so the browser can download without CORS.
++		fetched, ferr := fetchURLAsBase64(url, key, 120*time.Second)
++		if ferr != nil {
++			c.JSON(http.StatusOK, gin.H{
++				"success":    false,
++				"error_code": "IMAGE_FETCH_FAILED",
++				"message":    fmt.Sprintf("上游返回的是图片 URL，但服务端拉取图片失败：%s", ferr.Error()),
++				"model":      imageModel,
++			})
++			return
++		}
++		b64 = fetched
++	}
++
++	c.JSON(http.StatusOK, gin.H{
++		"success": true,
++		"model":   imageModel,
++		"format":  "b64_json",
++		"image":   b64,
++		"message": "",
++	})
++}
++
++// resolveImageModel returns the image model to use for the test. When override is
++// non-empty it is used directly; otherwise the channel's model list is scanned
++// for the first entry that looks like an image-generation model.
++func resolveImageModel(channel *model.Channel, override string) (string, []string) {
++	models := channel.GetModels()
++	if override != "" {
++		return override, models
++	}
++	for _, m := range models {
++		lower := strings.ToLower(m)
++		for _, kw := range imageModelKeywords {
++			if strings.Contains(lower, kw) {
++				return m, models
++			}
++		}
++	}
++	return "", models
++}
++
++func fetchURLAsBase64(rawURL, key string, timeout time.Duration) (string, error) {
++	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
++	if err != nil {
++		return "", err
++	}
++	if key != "" {
++		req.Header.Set("Authorization", "Bearer "+key)
++	}
++	client := &http.Client{Timeout: timeout}
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
++	}
++	data, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return "", err
++	}
++	return base64.StdEncoding.EncodeToString(data), nil
++}
++
++func truncate(s string, n int) string {
++	if len(s) <= n {
++		return s
++	}
++	return s[:n] + "..."
++}
+diff --git a/router/channel-router.go b/router/channel-router.go
+index e4cd4bdb5..c1dfa35e7 100644
+--- a/router/channel-router.go
++++ b/router/channel-router.go
+@@ -66,6 +66,7 @@ var channelPermissionRoutes = []permissionRoute{
+ 	{method: http.MethodGet, path: "/:id", permission: authz.ChannelRead, handler: controller.GetChannel},
+ 	{method: http.MethodGet, path: "/test", permission: authz.ChannelOperate, handler: controller.TestAllChannels},
+ 	{method: http.MethodGet, path: "/test/:id", permission: authz.ChannelOperate, handler: controller.TestChannel},
++	{method: http.MethodPost, path: "/test_image/:id", permission: authz.ChannelOperate, handler: controller.TestChannelImage},
+ 	{method: http.MethodGet, path: "/update_balance", permission: authz.ChannelOperate, handler: controller.UpdateAllChannelsBalance},
+ 	{method: http.MethodGet, path: "/update_balance/:id", permission: authz.ChannelOperate, handler: controller.UpdateChannelBalance},
+ 	{method: http.MethodPost, path: "/", permission: authz.ChannelSensitiveWrite, handler: controller.AddChannel},
+diff --git a/web/src/features/channels/api.ts b/web/src/features/channels/api.ts
+index eea31a80b..53fe81360 100644
+--- a/web/src/features/channels/api.ts
++++ b/web/src/features/channels/api.ts
+@@ -28,6 +28,7 @@ import type {
+   BatchSetTagParams,
+   Channel,
+   ChannelBalanceResponse,
++  ChannelImageTestResponse,
+   ChannelOpsResponse,
+   ChannelTestResponse,
+   CopyChannelParams,
+@@ -293,6 +294,23 @@ export async function testChannel(
+   return res.data
+ }
+ 
++/**
++ * Test a channel's image-generation capability by calling its first image model
++ * against the upstream images endpoint. The upstream URL is derived from the
++ * channel configuration on the server, so no upstream host is hard-coded.
++ */
++export async function testChannelImage(
++  id: number,
++  params?: { model?: string; endpoint?: string }
++): Promise<ChannelImageTestResponse> {
++  const res = await api.post(
++    `/api/channel/test_image/${id}`,
++    {},
++    channelActionConfig({ params })
++  )
++  return res.data
++}
++
+ /**
+  * Update channel balance
+  */
+diff --git a/web/src/features/channels/components/data-table-row-actions.tsx b/web/src/features/channels/components/data-table-row-actions.tsx
+index d52dbd7bd..4058ae50d 100644
+--- a/web/src/features/channels/components/data-table-row-actions.tsx
++++ b/web/src/features/channels/components/data-table-row-actions.tsx
+@@ -33,6 +33,7 @@ import {
+   Trash2,
+   RefreshCw,
+   Loader2,
++  Image as ImageIcon,
+ } from 'lucide-react'
+ import { useContext, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+@@ -64,6 +65,7 @@ import {
+   channelsQueryKeys,
+   handleDeleteChannel,
+   handleTestChannel,
++  handleTestChannelImage,
+   handleToggleChannelStatus,
+   isChannelEnabled,
+   isMultiKeyChannel,
+@@ -117,6 +119,16 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
+     }
+   }
+ 
++  const [isTestingImage, setIsTestingImage] = useState(false)
++  const handleTestImage = async () => {
++    setIsTestingImage(true)
++    try {
++      await handleTestChannelImage(channel.id, { channelName: channel.name })
++    } finally {
++      setIsTestingImage(false)
++    }
++  }
++
+   const handleQueryBalance = () => {
+     setCurrentRow(channel)
+     setOpen('balance-query')
+@@ -280,6 +292,14 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
+             </DropdownMenuShortcut>
+           </DropdownMenuItem>
+ 
++          {/* Test Image Generation */}
++          <DropdownMenuItem onClick={handleTestImage} disabled={isTestingImage}>
++            {isTestingImage ? t('Testing Image…') : t('测试生图')}
++            <DropdownMenuShortcut>
++              <ImageIcon size={16} />
++            </DropdownMenuShortcut>
++          </DropdownMenuItem>
++
+           {/* Query Balance */}
+           <DropdownMenuItem onClick={handleQueryBalance}>
+             {t('Query Balance')}
+diff --git a/web/src/features/channels/lib/channel-actions.ts b/web/src/features/channels/lib/channel-actions.ts
+index 266abc01c..2841a6e79 100644
+--- a/web/src/features/channels/lib/channel-actions.ts
++++ b/web/src/features/channels/lib/channel-actions.ts
+@@ -27,6 +27,7 @@ import {
+   copyChannel,
+   deleteChannel,
+   testChannel,
++  testChannelImage,
+   updateChannel,
+   updateChannelStatus,
+   batchUpdateChannelStatus,
+@@ -41,7 +42,11 @@ import {
+   updateAllChannelsBalance,
+ } from '../api'
+ import { CHANNEL_STATUS, ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
+-import type { ChannelTestResponse, CopyChannelParams } from '../types'
++import type {
++  ChannelImageTestResponse,
++  ChannelTestResponse,
++  CopyChannelParams,
++} from '../types'
+ 
+ // ============================================================================
+ // Query Keys
+@@ -345,6 +350,74 @@ export async function handleTestChannel(
+   }
+ }
+ 
++/**
++ * Trigger a browser download for a base64-encoded image.
++ */
++function downloadBase64Image(base64: string, filename: string): void {
++  const clean = base64.includes(',') ? base64.split(',')[1] : base64
++  const byteChars = atob(clean)
++  const byteNumbers = new Array(byteChars.length)
++  for (let i = 0; i < byteChars.length; i++) {
++    byteNumbers[i] = byteChars.charCodeAt(i)
++  }
++  const byteArray = new Uint8Array(byteNumbers)
++  const blob = new Blob([byteArray], { type: 'image/png' })
++  const url = URL.createObjectURL(blob)
++  const a = document.createElement('a')
++  a.href = url
++  a.download = filename
++  document.body.appendChild(a)
++  a.click()
++  a.remove()
++  URL.revokeObjectURL(url)
++}
++
++/**
++ * Test a channel's image-generation capability: call the channel's first image
++ * model against the upstream images endpoint, download the generated image to the
++ * browser's default download location, and surface the result via a toast.
++ */
++export async function handleTestChannelImage(
++  id: number,
++  options?: { channelName?: string; model?: string }
++): Promise<void> {
++  try {
++    const resp: ChannelImageTestResponse = await testChannelImage(id, {
++      model: options?.model,
++    })
++    if (resp.success && resp.format === 'b64_json' && resp.image) {
++      const safeModel = (resp.model || 'image').replace(/[^a-zA-Z0-9_-]/g, '_')
++      downloadBase64Image(resp.image, `channel_${id}_${safeModel}.png`)
++      toast.success(
++        options?.channelName
++          ? i18next.t('{{name}} 图片生成成功，请打开校验', { name: options.channelName })
++          : i18next.t('图片生成成功，请打开校验')
++      )
++      return
++    }
++
++    const msg = resp.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
++    toast.error(
++      i18next.t('图片生成失败'),
++      resp.error_code
++        ? { description: `${msg} (${resp.error_code})` }
++        : { description: msg }
++    )
++  } catch (error) {
++    const err = error as {
++      response?: { data?: { message?: string; error_code?: string } }
++    }
++    const data = err?.response?.data
++    const msg = data?.message || i18next.t(ERROR_MESSAGES.TEST_FAILED)
++    toast.error(
++      i18next.t('图片生成失败'),
++      data?.error_code
++        ? { description: `${msg} (${data.error_code})` }
++        : { description: msg }
++    )
++  }
++}
++
+ /**
+  * Copy a channel
+  */
+diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
+index 721e216e9..a1990d0b6 100644
+--- a/web/src/features/channels/types.ts
++++ b/web/src/features/channels/types.ts
+@@ -206,6 +206,16 @@ export interface ChannelTestResponse {
+   }
+ }
+ 
++export interface ChannelImageTestResponse {
++  success: boolean
++  model?: string
++  format?: 'b64_json' | 'url'
++  image?: string
++  message?: string
++  error_code?: string
++  tried_models?: string[]
++}
++
+ export interface ChannelBalanceResponse {
+   success: boolean
+   message?: string

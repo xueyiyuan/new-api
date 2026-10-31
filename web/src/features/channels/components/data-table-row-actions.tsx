@@ -33,6 +33,7 @@ import {
   Trash2,
   RefreshCw,
   Loader2,
+  Image as ImageIcon,
 } from 'lucide-react'
 import { useContext, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -64,6 +65,7 @@ import {
   channelsQueryKeys,
   handleDeleteChannel,
   handleTestChannel,
+  handleTestChannelImage,
   handleToggleChannelStatus,
   isChannelEnabled,
   isMultiKeyChannel,
@@ -114,6 +116,16 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
       })
     } finally {
       setIsTesting(false)
+    }
+  }
+
+  const [isTestingImage, setIsTestingImage] = useState(false)
+  const handleTestImage = async () => {
+    setIsTestingImage(true)
+    try {
+      await handleTestChannelImage(channel.id, { channelName: channel.name })
+    } finally {
+      setIsTestingImage(false)
     }
   }
 
@@ -277,6 +289,14 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             {t('Test Connection')}
             <DropdownMenuShortcut>
               <PlugZap size={16} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
+
+          {/* Test Image Generation */}
+          <DropdownMenuItem onClick={handleTestImage} disabled={isTestingImage}>
+            {isTestingImage ? t('Testing Image…') : t('测试生图')}
+            <DropdownMenuShortcut>
+              <ImageIcon size={16} />
             </DropdownMenuShortcut>
           </DropdownMenuItem>
 

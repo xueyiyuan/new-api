@@ -28,6 +28,7 @@ import type {
   BatchSetTagParams,
   Channel,
   ChannelBalanceResponse,
+  ChannelImageTestResponse,
   ChannelOpsResponse,
   ChannelTestResponse,
   CopyChannelParams,
@@ -288,6 +289,23 @@ export async function testChannel(
 ): Promise<ChannelTestResponse> {
   const res = await api.get(
     `/api/channel/test/${id}`,
+    channelActionConfig({ params })
+  )
+  return res.data
+}
+
+/**
+ * Test a channel's image-generation capability by calling its first image model
+ * against the upstream images endpoint. The upstream URL is derived from the
+ * channel configuration on the server, so no upstream host is hard-coded.
+ */
+export async function testChannelImage(
+  id: number,
+  params?: { model?: string; endpoint?: string }
+): Promise<ChannelImageTestResponse> {
+  const res = await api.post(
+    `/api/channel/test_image/${id}`,
+    {},
     channelActionConfig({ params })
   )
   return res.data
