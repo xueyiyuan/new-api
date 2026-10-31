@@ -1,5 +1,8 @@
 FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS builder
 
+# 国内源加速：bun 安装前端依赖走 npmmirror
+ENV npm_config_registry=https://registry.npmmirror.com
+
 WORKDIR /build/web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
@@ -8,6 +11,8 @@ COPY ./VERSION /build/VERSION
 RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
 
 FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder2
+# 国内源加速：go mod download 走 goproxy.cn
+ENV GOPROXY=https://goproxy.cn,direct GOSUMDB=off
 ENV GO111MODULE=on CGO_ENABLED=0 GOWORK=off
 
 ARG TARGETOS
@@ -31,9 +36,12 @@ RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/Calcium-Ion/moejs)/defa
 FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 
 RUN set -e; \
+    echo 'Acquire::http::Proxy "false";' > /etc/apt/apt.conf.d/95noprox; \
+    echo 'Acquire::https::Proxy "false";' >> /etc/apt/apt.conf.d/95noprox; \
     sed -i 's#deb.debian.org#mirrors.aliyun.com#g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's#deb.debian.org#mirrors.aliyun.com#g' /etc/apt/sources.list 2>/dev/null || true; \
-    apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates
 
